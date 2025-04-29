@@ -2,31 +2,34 @@ import rclpy
 from rclpy.node import Node
 import torch
 import numpy as np
-from sensor_msgs.msg import Image, PointCloud2, PointField
+from sensor_msgs.msg import Image, PointCloud2, PointField, CameraInfo
 from cv_bridge import CvBridge
 
 from std_msgs.msg import Header
 import cv2
 from tf2_ros import StaticTransformBroadcaster
 from geometry_msgs.msg import TransformStamped
-
+import yaml
 
 class DepthProcessorNode(Node):
     def __init__(self):
         super().__init__('depth_processor')
+        self.declare_parameter('camera_info_path', '/home/rahgirrafi/ws_ESP32_CAM_MonoDepth/src/MonoDepth/config/camera_calibration.yaml')
+        self._load_camera_info()
         self.declare_parameters(namespace='',
             parameters=[
                 ('image_topic', 'camera/image'),
                 ('depth_image_topic', 'camera/depth'),
                 ('pointcloud_topic', 'camera/points'),
-                ('fx', 320.0),
-                ('fy', 320.0),
-                ('cx', 160.0),
-                ('cy', 120.0),
+                ('fx', self.fx),
+                ('fy', self.fy),
+                ('cx', self.cx),
+                ('cy', self.cy),
                 ('depth_scale', 0.1),
                 ('downsample_factor', 2),
                 ('colormap', 11)
             ])
+        
         
         self.depthmap = None
         self.bridge = CvBridge()
@@ -53,6 +56,34 @@ class DepthProcessorNode(Node):
         self.tf_broadcaster = StaticTransformBroadcaster(self)
         self._publish_static_tf()
 
+    def _load_camera_info(self):
+        """Load camera calibration from YAML file"""
+        try:
+            path = self.get_parameter('camera_info_path').value
+            with open(path, 'r') as file:
+                calib_data = yaml.safe_load(file)
+            
+            self.camera_info = CameraInfo()
+            self.camera_info.header.frame_id = "camera_frame"
+            self.camera_info.height = calib_data['image_height']
+            self.camera_info.width = calib_data['image_width']
+            self.camera_info.k = calib_data['camera_matrix']['data']
+            self.camera_info.d = calib_data['distortion_coefficients']['data']
+            self.camera_info.r = calib_data['rectification_matrix']['data']
+            self.camera_info.p = calib_data['projection_matrix']['data']
+            self.camera_info.distortion_model = calib_data['distortion_model']
+            
+            camera_matrix = calib_data['camera_matrix']['data']
+            self.fx, self.fy, self.cx, self.cy = camera_matrix[0], camera_matrix[4], camera_matrix[2], camera_matrix[5]
+            
+            self.get_logger().info(f"Loaded camera calibration from {path}")
+            
+        except Exception as e:
+            self.get_logger().error(f"Failed to load camera info: {str(e)}")
+            raise
+
+        
+
     def _publish_static_tf(self):
         transform = TransformStamped()
         transform.header.stamp = self.get_clock().now().to_msg()
@@ -64,9 +95,16 @@ class DepthProcessorNode(Node):
 
     def _init_model(self):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = torch.hub.load("intel-isl/MiDaS", "MiDaS_small").to(self.device)
+        self.model_type = "DPT_Hybrid"  # Default model type
+        self.model = torch.hub.load("intel-isl/MiDaS", self.model_type).to(self.device)
         self.model.eval()
-        self.transform = torch.hub.load("intel-isl/MiDaS", "transforms").small_transform
+        
+        self.midas_transform = torch.hub.load("intel-isl/MiDaS", "transforms")
+
+        if self.model_type == "DPT_Large" or self.model_type == "DPT_Hybrid":
+            transform = self.midas_transform.dpt_transform
+        else:
+            transform = self.midas_transform.small_transform
 
     def image_callback(self, msg):
         try:
