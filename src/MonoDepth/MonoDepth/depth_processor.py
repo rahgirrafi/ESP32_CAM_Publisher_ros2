@@ -98,13 +98,11 @@ class DepthProcessorNode(Node):
         self.model_type = "DPT_Hybrid"  # Default model type
         self.model = torch.hub.load("intel-isl/MiDaS", self.model_type).to(self.device)
         self.model.eval()
-        
-        self.midas_transform = torch.hub.load("intel-isl/MiDaS", "transforms")
 
         if self.model_type == "DPT_Large" or self.model_type == "DPT_Hybrid":
-            transform = self.midas_transform.dpt_transform
+            self.midas_transform = torch.hub.load("intel-isl/MiDaS", "transforms").dpt_transform
         else:
-            transform = self.midas_transform.small_transform
+            self.midas_transform = torch.hub.load("intel-isl/MiDaS", "transforms").small_transform
 
     def image_callback(self, msg):
         try:
@@ -134,7 +132,7 @@ class DepthProcessorNode(Node):
    
     def _process_depth(self, frame):
         img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        input_batch = self.transform(img).to(self.device)
+        input_batch = self.midas_transform(img).to(self.device)
         
         with torch.no_grad():
             prediction = self.model(input_batch)
