@@ -11,6 +11,8 @@ from tf2_ros import StaticTransformBroadcaster
 from geometry_msgs.msg import TransformStamped
 import yaml
 
+from MonoDepth.depth_anything_v2.dpt import DepthAnythingV2
+
 class DepthProcessorNode(Node):
     def __init__(self):
         super().__init__('depth_processor')
@@ -27,12 +29,23 @@ class DepthProcessorNode(Node):
                 ('cy', self.cy),
                 ('depth_scale', 0.1),
                 ('downsample_factor', 2),
-                ('colormap', 11)
+                ('colormap', 11),
+                ('encoder_type', 'vits')  # vits, vitb, vitl, vitg
+
             ])
         
+        self.model_configs = {
+            'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
+            'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
+            'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
+            'vitg': {'encoder': 'vitg', 'features': 384, 'out_channels': [1536, 1536, 1536, 1536]}
+        }
         
+        self.device = self._get_device()
         self.depthmap = None
         self.bridge = CvBridge()
+
+        
         self.subscription = self.create_subscription(
             Image,
             self.get_parameter('image_topic').value,
@@ -82,7 +95,13 @@ class DepthProcessorNode(Node):
             self.get_logger().error(f"Failed to load camera info: {str(e)}")
             raise
 
-        
+    def _get_device(self):
+        """Determine available compute device"""
+        if torch.cuda.is_available():
+            return 'cuda'
+        if torch.backends.mps.is_available():
+            return 'mps'
+        return 'cpu'
 
     def _publish_static_tf(self):
         transform = TransformStamped()
@@ -94,20 +113,37 @@ class DepthProcessorNode(Node):
         self.tf_broadcaster.sendTransform(transform)
 
     def _init_model(self):
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model_type = "DPT_Hybrid"  # Default model type
-        self.model = torch.hub.load("intel-isl/MiDaS", self.model_type).to(self.device)
-        self.model.eval()
-
-        if self.model_type == "DPT_Large" or self.model_type == "DPT_Hybrid":
-            self.midas_transform = torch.hub.load("intel-isl/MiDaS", "transforms").dpt_transform
-        else:
-            self.midas_transform = torch.hub.load("intel-isl/MiDaS", "transforms").small_transform
+        """Initialize Depth Anything V2 model"""
+        try:
+            encoder_type = self.get_parameter('encoder_type').value
+            config = self.model_configs[encoder_type]
+            
+            self.model = DepthAnythingV2(**config)
+            checkpoint_path = '/home/rahgirrafi/ws_ESP32_CAM_MonoDepth/src/MonoDepth/checkpoints/depth_anything_v2_vits.pth'
+            
+            # Load pretrained weights
+            self.model.load_state_dict(
+                torch.load(checkpoint_path, map_location='cpu')
+            )
+            
+            self.model = self.model.to(self.device).eval()
+            self.get_logger().info(f"Loaded Depth Anything V2 ({encoder_type}) on {self.device}")     
+        except Exception as e:
+            self.get_logger().error(f"Model initialization failed: {str(e)}")
+            raise
+        
 
     def image_callback(self, msg):
         try:
             frame = self.bridge.imgmsg_to_cv2(msg, "bgr8")
             depth_map = self._process_depth(frame)
+            if depth_map is None:
+                self.get_logger().error("Failed to generate depth map")
+                return
+                
+            if depth_map.shape != frame.shape[:2]:
+                self.get_logger().error(f"Depth map shape mismatch: {depth_map.shape} vs {frame.shape[:2]}")
+                return
             self._publish_depth_image(depth_map, msg.header)
             pointcloud = self._create_pointcloud(depth_map, frame)
             self.pointcloud_pub.publish(pointcloud)
@@ -131,19 +167,44 @@ class DepthProcessorNode(Node):
             self.get_logger().error(f"Depth image publishing error: {str(e)}")
    
     def _process_depth(self, frame):
-        img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        input_batch = self.midas_transform(img).to(self.device)
-        
-        with torch.no_grad():
-            prediction = self.model(input_batch)
-            prediction = torch.nn.functional.interpolate(
-                prediction.unsqueeze(1),
-                size=img.shape[:2],
-                mode="bicubic",
-                align_corners=False,
-            ).squeeze()
-        
-        return prediction.cpu().numpy()
+        """Process frame with Depth Anything V2"""
+        try:
+            # Original dimensions
+            h, w = frame.shape[:2]
+            patch_size = 14  # ViT patch size
+
+            # Calculate padding needed
+            pad_h = (patch_size - h % patch_size) % patch_size
+            pad_w = (patch_size - w % patch_size) % patch_size
+
+            # Pad image symmetrically
+            padded_frame = cv2.copyMakeBorder(
+                frame,
+                top=pad_h//2,
+                bottom=pad_h - pad_h//2,
+                left=pad_w//2,
+                right=pad_w - pad_w//2,
+                borderType=cv2.BORDER_REFLECT
+            )
+
+            # Convert to tensor and normalize
+            frame_tensor = torch.from_numpy(padded_frame).permute(2, 0, 1).float().to(self.device)
+            frame_tensor = frame_tensor.unsqueeze(0) / 255.0
+
+            # Perform inference
+            with torch.no_grad():
+                depth_tensor = self.model(frame_tensor)
+
+            # Convert to numpy and crop back to original size
+            depth_map = depth_tensor.squeeze().cpu().numpy()
+            depth_map = depth_map[pad_h//2:pad_h//2 + h, pad_w//2:pad_w//2 + w]
+
+            return depth_map
+
+        except Exception as e:
+            self.get_logger().error(f"Depth processing failed: {str(e)}")
+            return None
+
 
     def _create_pointcloud(self, depth_map, color_frame):
         points = []
